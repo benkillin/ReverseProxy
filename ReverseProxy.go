@@ -103,6 +103,8 @@ func main() {
 			proxy := httputil.NewSingleHostReverseProxy(remote)
 
 			proxy.Transport = httpClientWithSelfSignedTLS // TODO: handle setting up THE SHIZNIT to handle custom TLS options.
+
+			proxies[host.Hostname] = proxy
 		}
 
 		upstreamProxies[path] = proxies
