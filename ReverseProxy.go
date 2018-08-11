@@ -34,23 +34,40 @@ type TLSProperties struct {
 
 // UpstreamHostConfig configuraiton options for the back end host that this reverse proxy is serving requests for it contains settings such as TLS trust settings, hostname, port, and any other necessary configuration information
 type UpstreamHostConfig struct {
-	HostPool                    []string
+	HostPool ServerPool
+}
+
+// ServerPool represents a pool of servers with a selection strategy for routing the next request
+type ServerPool struct {
+	Hosts                       []Host
 	PoolMemberSelectionStrategy string
+}
+
+// Host represents a back end host with a particular configuration for TLS
+type Host struct {
+	Hostname  string
+	TLSConfig *TLSProperties // optional
+}
+
+func (p *ServerPool) nextHost() string {
+	// TODO: have a variety of selection strategies available for this.
+	return p.Hosts[0].Hostname
 }
 
 func main() {
 	configFile := "reverseConfig.json"
+	ROUND_ROBIN := "round-robin" // TODO: enum or something plz?
 
 	defaultConfig := &Config{
 		ListenPort: ":8080",
 		Backends: map[string]UpstreamHostConfig{
-			"/path1": UpstreamHostConfig{[]string{"https://localhost:7443/"}},
-			"/path2": UpstreamHostConfig{[]string{"https://localhost:8443/"}},
-			"/path3": UpstreamHostConfig{[]string{"https://localhost:9443/"}},
-			"/path4": UpstreamHostConfig{[]string{"https://localhost:10443/"}},
+			"/path1": UpstreamHostConfig{ServerPool{[]Host{Host{"https://google.com:443/", nil}}, ROUND_ROBIN}},
+			"/path2": UpstreamHostConfig{ServerPool{[]Host{Host{"https://localhost:8443/", nil}}, ROUND_ROBIN}},
+			"/path3": UpstreamHostConfig{ServerPool{[]Host{Host{"https://localhost:9443/", nil}}, ROUND_ROBIN}},
+			"/path4": UpstreamHostConfig{ServerPool{[]Host{Host{"https://localhost:10443/", nil}}, ROUND_ROBIN}},
 		}}
 
-	singleHostProxies := make(map[string]*(httputil.ReverseProxy))
+	upstreamProxies := make(map[string]map[string]*(httputil.ReverseProxy))
 
 	config := &Config{}
 
@@ -70,17 +87,25 @@ func main() {
 		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
 	}
 
-	for path, host := range config.Backends {
-		log.Println(path + " " + host.Host)
+	for path, hostConfig := range config.Backends {
+		log.Printf("%s %s", path, hostConfig)
 
-		remote, err := url.Parse(host.Host)
-		if err != nil {
-			log.Fatalf("Error: unable to parse host %s: %s", host, err)
+		// TODO: handle setting up multiple possible back-ends for a particular request path
+		// TODO: find the howto article about making your own proxy configuration instead
+		// of setting up multiple single host proxies
+		proxies := make(map[string]*(httputil.ReverseProxy))
+
+		for _, host := range hostConfig.HostPool.Hosts {
+			remote, err := url.Parse(host.Hostname)
+			if err != nil {
+				log.Fatalf("Error: unable to parse host %s: %s", host, err)
+			}
+			proxy := httputil.NewSingleHostReverseProxy(remote)
+
+			proxy.Transport = httpClientWithSelfSignedTLS // TODO: handle setting up THE SHIZNIT to handle custom TLS options.
 		}
-		proxy := httputil.NewSingleHostReverseProxy(remote)
-		proxy.Transport = httpClientWithSelfSignedTLS
 
-		singleHostProxies[path] = proxy
+		upstreamProxies[path] = proxies
 	}
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -90,7 +115,11 @@ func main() {
 
 		for path, host := range config.Backends {
 			if strings.HasPrefix(requestedPath, path) {
-				singleHostProxies[path].ServeHTTP(w, r)
+				pool := upstreamProxies[path]
+
+				nextUpstream := host.HostPool.nextHost()
+
+				pool[nextUpstream].ServeHTTP(w, r)
 				log.Printf("Serving request for %s (path %s) using host %s.", requestedPath, path, host)
 				found = true
 				break
