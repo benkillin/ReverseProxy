@@ -88,6 +88,11 @@ func (p *ServerPool) nextHost() string {
 }
 
 func main() {
+	log.Printf("test")
+	log.SetFormatter(&log.TextFormatter{})
+	level, _ := log.ParseLevel("trace")
+	log.SetLevel(level)
+
 	configFile := "reverseConfig.json"
 	ROUND_ROBIN := "round-robin" // TODO: enum or something plz?
 
@@ -105,7 +110,10 @@ func main() {
 
 	config := &Config{}
 
-	ConfigHelper.GetConfigWithDefault(configFile, defaultConfig, config)
+	err := ConfigHelper.GetConfigWithDefault(configFile, defaultConfig, config)
+	if err != nil {
+		log.Fatalf("error loading/saving config/default config. %s", err)
+	}
 
 	// Need to setup an override to the transport.
 	defaultTransport := http.DefaultTransport.(*http.Transport)
@@ -188,13 +196,18 @@ func main() {
 	listenAddr := config.ListenHost + ":" + config.ListenPort
 
 	if config.ListenTLS != nil {
+		log.Debugf("Listening TLS")
 		// TODO: support specifying advanced TLS options such as tls version and cipher suites.
 		// see https://stackoverflow.com/questions/31226131/how-to-set-tls-cipher-for-go-server
-		http.ListenAndServeTLS(listenAddr, config.ListenTLS.CertPath, config.ListenTLS.KeyPath, nil)
+		err = http.ListenAndServeTLS(listenAddr, config.ListenTLS.CertPath, config.ListenTLS.KeyPath, nil)
 	} else {
-		http.ListenAndServe(listenAddr, nil)
+		log.Debugf("Listening???")
+		err = http.ListenAndServe(listenAddr, nil)
 	}
 
+	if err != nil {
+		log.Fatalf("Error setting up server for socket listen: %s", err)
+	}
 }
 
 func loadCertPool(file string) (*x509.CertPool, error) {
