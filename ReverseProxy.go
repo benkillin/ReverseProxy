@@ -2,11 +2,18 @@ package main
 
 import (
 	"crypto/tls"
-	"log"
+	"crypto/x509"
+	//	"errors"
+	"fmt"
+	"io/ioutil"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"strings"
+
+	// "golang.org/x/net/http2" // ooohhhhh fancy!
+
+	log "github.com/sirupsen/logrus"
 
 	"github.com/benkillin/ConfigHelper"
 )
@@ -22,14 +29,19 @@ type Config struct {
 
 // TLSProperties defines properties such as certificate and key for the cert and key file to use and whether or not mutually authenticated TLS is to be used and if so the different attributes that are necessary to be defined for mutually authenticated TLS.
 type TLSProperties struct {
-	TLSCertPath             string
-	TLSKeyPath              string
-	TLSMutualAuth           bool
-	TLSMutualAuthCAListFile string
-	TLSRevocationListCheck  bool
-	TLSRevocationListFile   string
-	TLSOCSPCheck            bool
-	TLSOCSPProvider         string
+	Insecure             bool // if true, allow insecure TLS connection to the back-end.
+	CertPath             string
+	KeyPath              string
+	TrustedCAs           string // path to trusted CA list of root CAs to use when this program is verifying the certificate presented by a backend server.
+	MutualAuth           bool
+	MutualAuthCAListFile string
+	RevocationListCheck  bool
+	RevocationListFile   string
+	OCSPCheck            bool
+	OCSPProvider         string
+	STSHttpHeader        bool        // do we add strict transport security header to stuff served by this server (ignored on tls config for communicating with backend hosts)
+	StrongTLS            bool        // "perfect ssl labs score?" see https://gist.github.com/denji/12b3a568f092ab951456
+	CustomTLSConfig      *tls.Config // If this is set, all the other options are ignored.
 }
 
 // UpstreamHostConfig configuraiton options for the back end host that this reverse proxy is serving requests for it contains settings such as TLS trust settings, hostname, port, and any other necessary configuration information
@@ -47,6 +59,7 @@ type ServerPool struct {
 type Host struct {
 	Hostname  string
 	TLSConfig *TLSProperties // optional
+	transport *http.Transport
 }
 
 func (p *ServerPool) nextHost() string {
@@ -59,12 +72,13 @@ func main() {
 	ROUND_ROBIN := "round-robin" // TODO: enum or something plz?
 
 	defaultConfig := &Config{
-		ListenPort: ":8080",
+		ListenHost: "",
+		ListenPort: "8080",
 		Backends: map[string]UpstreamHostConfig{
-			"/path1": UpstreamHostConfig{ServerPool{[]Host{Host{"https://google.com:443/", nil}}, ROUND_ROBIN}},
-			"/path2": UpstreamHostConfig{ServerPool{[]Host{Host{"https://localhost:8443/", nil}}, ROUND_ROBIN}},
-			"/path3": UpstreamHostConfig{ServerPool{[]Host{Host{"https://localhost:9443/", nil}}, ROUND_ROBIN}},
-			"/path4": UpstreamHostConfig{ServerPool{[]Host{Host{"https://localhost:10443/", nil}}, ROUND_ROBIN}},
+			"/path1": UpstreamHostConfig{ServerPool{[]Host{Host{"https://google.com:443/", nil, nil}}, ROUND_ROBIN}},
+			"/path2": UpstreamHostConfig{ServerPool{[]Host{Host{"https://localhost:8443/", nil, nil}}, ROUND_ROBIN}},
+			"/path3": UpstreamHostConfig{ServerPool{[]Host{Host{"https://localhost:9443/", nil, nil}}, ROUND_ROBIN}},
+			"/path4": UpstreamHostConfig{ServerPool{[]Host{Host{"https://localhost:10443/", nil, nil}}, ROUND_ROBIN}},
 		}}
 
 	upstreamProxies := make(map[string]map[string]*(httputil.ReverseProxy))
@@ -77,7 +91,7 @@ func main() {
 	defaultTransport := http.DefaultTransport.(*http.Transport)
 
 	// Create new Transport that ignores self-signed SSL
-	httpClientWithSelfSignedTLS := &http.Transport{
+	/*insecureDefaultTransport := &http.Transport{
 		Proxy:                 defaultTransport.Proxy,
 		DialContext:           defaultTransport.DialContext,
 		MaxIdleConns:          defaultTransport.MaxIdleConns,
@@ -85,10 +99,10 @@ func main() {
 		ExpectContinueTimeout: defaultTransport.ExpectContinueTimeout,
 		TLSHandshakeTimeout:   defaultTransport.TLSHandshakeTimeout,
 		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
-	}
+	}*/
 
 	for path, hostConfig := range config.Backends {
-		log.Printf("%s %s", path, hostConfig)
+		log.Debugf("%s %v", path, hostConfig)
 
 		// TODO: handle setting up multiple possible back-ends for a particular request path
 		// TODO: find the howto article about making your own proxy configuration instead
@@ -98,11 +112,22 @@ func main() {
 		for _, host := range hostConfig.HostPool.Hosts {
 			remote, err := url.Parse(host.Hostname)
 			if err != nil {
-				log.Fatalf("Error: unable to parse host %s: %s", host, err)
+				log.Fatalf("Error: unable to parse host %v: %s", host, err)
 			}
 			proxy := httputil.NewSingleHostReverseProxy(remote)
+			customTransport := *defaultTransport // ignore lint error about copying the mutex.
 
-			proxy.Transport = httpClientWithSelfSignedTLS // TODO: handle setting up THE SHIZNIT to handle custom TLS options.
+			if host.TLSConfig != nil {
+				config, err := host.TLSConfig.GetTLSConfig()
+				if err != nil {
+					log.Fatalf("Error: unable to convert TLSConfig to tls.Config: %s", err)
+				}
+
+				customTransport.TLSClientConfig = config
+				proxy.Transport = &customTransport
+			} else {
+				proxy.Transport = defaultTransport
+			}
 
 			proxies[host.Hostname] = proxy
 		}
@@ -110,6 +135,11 @@ func main() {
 		upstreamProxies[path] = proxies
 	}
 
+	// The reason we set up the single host proxies above and then have a handle func that
+	// finds the correct single host proxy for the URI prefix is so we can support having optional scripting
+	// or custom handlers for various requests in the future, which would be defined as part of the backend
+	// config. Also, it is set up like this so that we can use custom host selection strategies in the case
+	// the back end is configured to have more than one upstream host.
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 
 		found := false
@@ -122,7 +152,7 @@ func main() {
 				nextUpstream := host.HostPool.nextHost()
 
 				pool[nextUpstream].ServeHTTP(w, r)
-				log.Printf("Serving request for %s (path %s) using host %s.", requestedPath, path, host)
+				log.Printf("Serving request for %s (path %s) using host %v.", requestedPath, path, host)
 				found = true
 				break
 			}
@@ -135,5 +165,108 @@ func main() {
 	})
 
 	// Start the server
-	http.ListenAndServe(config.ListenPort, nil)
+	listenAddr := config.ListenHost + ":" + config.ListenPort
+
+	if config.ListenTLS != nil {
+		// TODO: support specifying advanced TLS options such as tls version and cipher suites.
+		// see https://stackoverflow.com/questions/31226131/how-to-set-tls-cipher-for-go-server
+		http.ListenAndServeTLS(listenAddr, config.ListenTLS.CertPath, config.ListenTLS.KeyPath, nil)
+	} else {
+		http.ListenAndServe(listenAddr, nil)
+	}
+
+}
+
+func loadCertPool(file string) (*x509.CertPool, error) {
+	trustedCAsForBackend, err := ioutil.ReadFile(file)
+	if err != nil {
+		return nil, fmt.Errorf("Error reading certificate pool file (%s): %s", file, err)
+	}
+
+	caPool := x509.NewCertPool()
+	if !caPool.AppendCertsFromPEM(trustedCAsForBackend) {
+		return nil, fmt.Errorf("Unable to load x509 cert pool with certificate data from file '%s'", file)
+	}
+	return caPool, nil
+}
+
+// GetTLSConfig Converts TLSProperties to tls.Config
+// see https://gist.github.com/michaljemala/d6f4e01c4834bf47a9c4
+// see https://gist.github.com/denji/12b3a568f092ab951456
+// see https://github.com/jomoespe/go-tls-mutual-auth/blob/master/server/server.go
+func (tlsConfig *TLSProperties) GetTLSConfig() (*tls.Config, error) {
+	if tlsConfig != nil {
+
+		config := &tls.Config{}
+
+		if tlsConfig.CustomTLSConfig != nil {
+			return tlsConfig.CustomTLSConfig, nil
+		}
+
+		if tlsConfig.CertPath != "" && tlsConfig.KeyPath != "" {
+			// the cert this program will use to authenticate with the backend:
+			hostBasedClientCert, err := tls.LoadX509KeyPair(tlsConfig.CertPath, tlsConfig.KeyPath)
+			if err != nil {
+				return nil, fmt.Errorf("Error loading certificate for tls.Config: %s", err)
+			}
+			config.Certificates = []tls.Certificate{hostBasedClientCert}
+		} else {
+			return nil, fmt.Errorf("Certificate keypair not specified")
+		}
+
+		if !tlsConfig.Insecure && tlsConfig.TrustedCAs != "" {
+			// the list of CAs to trust for verifying the certificate the backend server sends this program:
+			caPool, err := loadCertPool(tlsConfig.TrustedCAs)
+			if err != nil {
+				return nil, fmt.Errorf("unable to load trusted CAs: %s", err)
+			}
+			config.RootCAs = caPool
+		}
+
+		if tlsConfig.MutualAuth {
+			if tlsConfig.MutualAuthCAListFile != "" {
+				caPool, err := loadCertPool(tlsConfig.MutualAuthCAListFile)
+				if err != nil {
+					return nil, fmt.Errorf("unable to load mutual auth CAs: %s", err)
+				}
+				config.ClientCAs = caPool
+			} // TODO: do we care if they specify mutual auth but dont set up a trust store for clients?
+
+			if tlsConfig.Insecure {
+				config.ClientAuth = tls.RequireAnyClientCert
+			} else {
+				config.ClientAuth = tls.RequireAndVerifyClientCert
+			}
+			// TODO:
+			//tls.NoClientCert
+			//tls.RequestClientCert
+			//tls.RequireAnyClientCert
+			//tls.VerifyClientCertIfGiven
+		}
+
+		// TODO: CRL and OCSP check handling
+
+		if tlsConfig.StrongTLS {
+			config.MinVersion = tls.VersionTLS12
+			config.CurvePreferences = []tls.CurveID{tls.CurveP521, tls.CurveP384, tls.CurveP256}
+			config.PreferServerCipherSuites = true
+			config.CipherSuites = []uint16{
+				tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+				tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+				tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
+				tls.TLS_RSA_WITH_AES_256_CBC_SHA,
+			}
+		}
+
+		config.BuildNameToCertificate()
+
+		if tlsConfig.Insecure {
+			config.InsecureSkipVerify = true
+		}
+
+		return config, nil
+
+	}
+
+	return nil, fmt.Errorf("Attempted to convert nil TLSProperties to tls.Config")
 }
